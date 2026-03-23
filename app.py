@@ -7,13 +7,15 @@ Streamlit Cloud deployment file.
 Pipeline Architecture:
   Pipeline 1 → Fine-tuned FinBERT  (financial sentiment)
   Pipeline 2 → Fine-tuned BERT     (dividend risk classifier, PRIMARY)
-  Pipeline 3 → BART-large-mnli     (zero-shot topic check)
+  Pipeline 3 → DistilBERT-MNLI     (zero-shot topic check)
   Aggregator → Weighted Danger Index (0–100)
 """
 
 import re
 import time
+import gc
 
+import torch
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -38,7 +40,7 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 SENTIMENT_MODEL_ID = "ruirui0506/finbert-dividend-sentiment"   # Pipeline 1
 RISK_MODEL_ID      = "ruirui0506/dividend-risk-bert"           # Pipeline 2
-ZEROSHOT_MODEL_ID  = "facebook/bart-large-mnli"                   # Pipeline 3
+ZEROSHOT_MODEL_ID  = "typeform/distilbert-base-uncased-mnli"   # Pipeline 3 (Swapped to lightweight model)
 
 DANGER_LABELS = [
     "dividend cut risk",
@@ -52,7 +54,7 @@ DANGER_LABELS = [
 WEIGHTS = {"sentiment": 0.25, "risk": 0.50, "topic": 0.25}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL LOADING  (cached so Streamlit doesn't reload on every interaction)
+# MODEL LOADING  (Optimized for CPU & 1GB RAM Limit)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_sentiment_pipeline():
@@ -60,15 +62,19 @@ def load_sentiment_pipeline():
     try:
         tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_ID)
         mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_ID)
+        # Quantize for ~50% RAM savings
+        mdl = torch.quantization.quantize_dynamic(mdl, {torch.nn.Linear}, dtype=torch.qint8)
         return pipeline(
             "text-classification", model=mdl, tokenizer=tok,
             device=-1, top_k=None,
         )
     except Exception:
-        # Fallback: base FinBERT (before fine-tuning is pushed to Hub)
         st.warning("⚠️ Fine-tuned sentiment model not found — using base ProsusAI/finbert.")
+        tok = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        mdl = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        mdl = torch.quantization.quantize_dynamic(mdl, {torch.nn.Linear}, dtype=torch.qint8)
         return pipeline(
-            "text-classification", model="ProsusAI/finbert",
+            "text-classification", model=mdl, tokenizer=tok,
             device=-1, top_k=None,
         )
 
@@ -79,25 +85,31 @@ def load_risk_pipeline():
     try:
         tok = AutoTokenizer.from_pretrained(RISK_MODEL_ID)
         mdl = AutoModelForSequenceClassification.from_pretrained(RISK_MODEL_ID)
+        mdl = torch.quantization.quantize_dynamic(mdl, {torch.nn.Linear}, dtype=torch.qint8)
         return pipeline(
             "text-classification", model=mdl, tokenizer=tok,
             device=-1, top_k=None,
         )
     except Exception:
-        # Fallback: base DistilBERT (before fine-tuning is pushed)
         st.warning("⚠️ Fine-tuned risk model not found — using base distilbert-base-uncased.")
+        tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        mdl = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased")
+        mdl = torch.quantization.quantize_dynamic(mdl, {torch.nn.Linear}, dtype=torch.qint8)
         return pipeline(
-            "text-classification", model="distilbert-base-uncased",
+            "text-classification", model=mdl, tokenizer=tok,
             device=-1, top_k=None,
         )
 
 
 @st.cache_resource(show_spinner=False)
 def load_zeroshot_pipeline():
-    """Pipeline 3 – BART-large-mnli for zero-shot dividend topic detection."""
+    """Pipeline 3 – DistilBERT zero-shot topic detection."""
+    tok = AutoTokenizer.from_pretrained(ZEROSHOT_MODEL_ID)
+    mdl = AutoModelForSequenceClassification.from_pretrained(ZEROSHOT_MODEL_ID)
+    mdl = torch.quantization.quantize_dynamic(mdl, {torch.nn.Linear}, dtype=torch.qint8)
     return pipeline(
         "zero-shot-classification",
-        model=ZEROSHOT_MODEL_ID, device=-1,
+        model=mdl, tokenizer=tok, device=-1,
     )
 
 
@@ -125,14 +137,10 @@ def get_sentences(text: str) -> list[str]:
 # PIPELINE RUNNERS
 # ─────────────────────────────────────────────────────────────────────────────
 def run_sentiment_analysis(chunks: list[str], sent_pipe) -> dict:
-    """
-    Pipeline 1 — FinBERT financial sentiment.
-    Aggregates per-chunk scores; maps high negativity → high danger contribution.
-    """
     pos_scores, neg_scores, neu_scores = [], [], []
 
     for chunk in chunks:
-        result = sent_pipe(chunk[:512], truncation=True)
+        result = sent_pipe(chunk, truncation=True, max_length=512)
         scores = {item["label"].lower(): item["score"] for item in result[0]}
         pos_scores.append(scores.get("positive", 0.0))
         neg_scores.append(scores.get("negative", 0.0))
@@ -146,22 +154,16 @@ def run_sentiment_analysis(chunks: list[str], sent_pipe) -> dict:
         "positive":    avg_pos,
         "negative":    avg_neg,
         "neutral":     avg_neu,
-        "danger_score": avg_neg * 100,   # 0–100: more negative → higher danger
+        "danger_score": avg_neg * 100,
     }
 
 
 def run_risk_classification(chunks: list[str], risk_pipe) -> dict:
-    """
-    Pipeline 2 — Fine-tuned dividend risk classifier (PRIMARY model).
-    LABEL_0 = Low Risk, LABEL_1 = Medium Risk, LABEL_2 = High Risk.
-    Aggregates probabilities across all chunks via averaging.
-    """
     low_probs, med_probs, high_probs = [], [], []
 
     for chunk in chunks:
-        result = risk_pipe(chunk[:512], truncation=True)
+        result = risk_pipe(chunk, truncation=True, max_length=512)
         scores = {item["label"]: item["score"] for item in result[0]}
-        # Accept both LABEL_X naming and human-readable naming
         low_probs.append(scores.get("LABEL_0", scores.get("Low Risk",    0.333)))
         med_probs.append(scores.get("LABEL_1", scores.get("Medium Risk", 0.333)))
         high_probs.append(scores.get("LABEL_2", scores.get("High Risk",  0.333)))
@@ -170,7 +172,6 @@ def run_risk_classification(chunks: list[str], risk_pipe) -> dict:
     avg_med  = float(np.mean(med_probs))
     avg_high = float(np.mean(high_probs))
 
-    # High risk contributes full weight; medium risk half weight
     danger_score = min((avg_high * 100) + (avg_med * 50), 100.0)
 
     return {
@@ -185,11 +186,6 @@ def run_risk_classification(chunks: list[str], risk_pipe) -> dict:
 
 
 def run_zeroshot_analysis(text: str, zs_pipe) -> dict:
-    """
-    Pipeline 3 — BART zero-shot classification.
-    Checks how strongly the transcript covers dividend-risk topics.
-    Uses the first 1 000 words to keep runtime acceptable on CPU.
-    """
     sample_text = " ".join(text.split()[:1000])
     result = zs_pipe(sample_text, DANGER_LABELS, multi_label=True)
     label_scores = dict(zip(result["labels"], result["scores"]))
@@ -206,7 +202,6 @@ def run_zeroshot_analysis(text: str, zs_pipe) -> dict:
 # DANGER INDEX
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_danger_index(s_score: float, r_score: float, t_score: float) -> float:
-    """Weighted fusion of three pipeline danger scores → single 0–100 index."""
     raw = (
         WEIGHTS["sentiment"] * s_score
         + WEIGHTS["risk"]    * r_score
@@ -216,7 +211,6 @@ def compute_danger_index(s_score: float, r_score: float, t_score: float) -> floa
 
 
 def get_signal(index: float) -> tuple[str, str]:
-    """Map index to (signal_label, hex_color)."""
     if index <= 30:
         return "HEALTHY",  "#1D9E75"
     elif index <= 55:
@@ -233,7 +227,6 @@ def get_signal(index: float) -> tuple[str, str]:
 def highlight_risky_sentences(
     text: str, sent_pipe, risk_pipe, max_sentences: int = 60
 ) -> list[dict]:
-    """Score each sentence; return top-5 highest-risk excerpts."""
     sentences = get_sentences(text)[:max_sentences]
     scored = []
 
@@ -241,11 +234,12 @@ def highlight_risky_sentences(
         if len(sent.split()) < 5:
             continue
         try:
-            s_res  = sent_pipe(sent[:512], truncation=True)
+            # Fixed string-slicing bug by just using `truncation=True` correctly
+            s_res  = sent_pipe(sent, truncation=True, max_length=512)
             s_dict = {item["label"].lower(): item["score"] for item in s_res[0]}
             neg    = s_dict.get("negative", 0.0)
 
-            r_res  = risk_pipe(sent[:512], truncation=True)
+            r_res  = risk_pipe(sent, truncation=True, max_length=512)
             r_dict = {item["label"]: item["score"] for item in r_res[0]}
             high   = r_dict.get("LABEL_2", r_dict.get("High Risk", 0.0))
 
@@ -258,66 +252,38 @@ def highlight_risky_sentences(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GAUGE CHART  (pure HTML/SVG — no external chart library required)
+# GAUGE CHART 
 # ─────────────────────────────────────────────────────────────────────────────
 def make_gauge(index: float, signal: str, color: str):
-    """Renders a semicircle gauge using pure HTML/SVG via st.markdown."""
-
-    # Gauge arc: 180 degrees semicircle
-    # Convert index (0-100) to angle (180 to 0 degrees, left to right)
     angle_deg  = 180 - (index / 100 * 180)
     angle_rad  = angle_deg * 3.14159 / 180
     needle_x   = 150 + 110 * (0 if angle_deg == 90 else
                   __import__('math').cos(angle_rad))
     needle_y   = 160 - 110 * __import__('math').sin(angle_rad)
 
-    # Zone colours
     zone_html = (
-        # Green zone  0-30   (arc from 180° to 126°)
-        "<path d='M 40 160 A 110 110 0 0 1 95 65' "
-        "fill='none' stroke='#1D9E75' stroke-width='18' stroke-linecap='butt'/>"
-        # Yellow zone 30-55  (arc from 126° to 90°)
-        "<path d='M 95 65 A 110 110 0 0 1 150 50' "
-        "fill='none' stroke='#BA7517' stroke-width='18' stroke-linecap='butt'/>"
-        # Orange zone 55-75  (arc from 90° to 54°)
-        "<path d='M 150 50 A 110 110 0 0 1 205 65' "
-        "fill='none' stroke='#D85A30' stroke-width='18' stroke-linecap='butt'/>"
-        # Red zone    75-100 (arc from 54° to 0°)
-        "<path d='M 205 65 A 110 110 0 0 1 260 160' "
-        "fill='none' stroke='#A32D2D' stroke-width='18' stroke-linecap='butt'/>"
+        "<path d='M 40 160 A 110 110 0 0 1 95 65' fill='none' stroke='#1D9E75' stroke-width='18' stroke-linecap='butt'/>"
+        "<path d='M 95 65 A 110 110 0 0 1 150 50' fill='none' stroke='#BA7517' stroke-width='18' stroke-linecap='butt'/>"
+        "<path d='M 150 50 A 110 110 0 0 1 205 65' fill='none' stroke='#D85A30' stroke-width='18' stroke-linecap='butt'/>"
+        "<path d='M 205 65 A 110 110 0 0 1 260 160' fill='none' stroke='#A32D2D' stroke-width='18' stroke-linecap='butt'/>"
     )
 
     gauge_html = f"""
     <div style='text-align:center;padding:10px 0 0 0'>
       <svg viewBox='0 0 300 190' width='100%' style='max-width:320px'>
-        <!-- Background arc -->
-        <path d='M 40 160 A 110 110 0 0 1 260 160'
-              fill='none' stroke='#e8e8e8' stroke-width='20'/>
-        <!-- Coloured zone arcs -->
+        <path d='M 40 160 A 110 110 0 0 1 260 160' fill='none' stroke='#e8e8e8' stroke-width='20'/>
         {zone_html}
-        <!-- Needle -->
-        <line x1='150' y1='160'
-              x2='{needle_x:.1f}' y2='{needle_y:.1f}'
-              stroke='{color}' stroke-width='3'
-              stroke-linecap='round'/>
-        <!-- Centre dot -->
+        <line x1='150' y1='160' x2='{needle_x:.1f}' y2='{needle_y:.1f}' stroke='{color}' stroke-width='3' stroke-linecap='round'/>
         <circle cx='150' cy='160' r='6' fill='{color}'/>
-        <!-- Zone labels -->
         <text x='28'  y='178' font-size='9' fill='#1D9E75' text-anchor='middle'>0</text>
         <text x='88'  y='62'  font-size='9' fill='#BA7517' text-anchor='middle'>30</text>
         <text x='150' y='36'  font-size='9' fill='#D85A30' text-anchor='middle'>55</text>
         <text x='212' y='62'  font-size='9' fill='#A32D2D' text-anchor='middle'>75</text>
         <text x='272' y='178' font-size='9' fill='#A32D2D' text-anchor='middle'>100</text>
-        <!-- Index value -->
-        <text x='150' y='148' font-size='28' font-weight='700'
-              fill='{color}' text-anchor='middle'>{index}</text>
-        <!-- Label -->
-        <text x='150' y='180' font-size='11' fill='gray' text-anchor='middle'>
-          Dividend Danger Index
-        </text>
+        <text x='150' y='148' font-size='28' font-weight='700' fill='{color}' text-anchor='middle'>{index}</text>
+        <text x='150' y='180' font-size='11' fill='gray' text-anchor='middle'>Dividend Danger Index</text>
       </svg>
-      <div style='font-size:1.1em;font-weight:700;color:{color};
-                  margin-top:2px;letter-spacing:1px'>{signal}</div>
+      <div style='font-size:1.1em;font-weight:700;color:{color};margin-top:2px;letter-spacing:1px'>{signal}</div>
     </div>
     """
     st.markdown(gauge_html, unsafe_allow_html=True)
@@ -385,7 +351,6 @@ def main():
         "to compute a real-time **Dividend Danger Index (0–100)**."
     )
 
-    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("📋 Company Info")
         company_name = st.text_input("Company Name", placeholder="e.g. Realty Income Corp")
@@ -407,9 +372,8 @@ def main():
         WEIGHTS.update({"sentiment": w_s, "risk": w_r, "topic": w_t})
         st.caption(f"Normalised → Sent: {w_s:.2f} | Risk: {w_r:.2f} | Topic: {w_t:.2f}")
         st.divider()
-        st.info("Models are cached after the first load (~30 s on CPU).")
+        st.info("Models are cached and dynamically quantized for CPU efficiency.")
 
-    # ── Transcript Input ──────────────────────────────────────────────────────
     st.subheader("📄 Earnings Call Transcript")
     col_left, col_right = st.columns([3, 1])
 
@@ -417,10 +381,7 @@ def main():
         transcript = st.text_area(
             "transcript_input",
             height=260,
-            placeholder=(
-                "Paste the full earnings call transcript here...\n\n"
-                "Tip: Include the CFO/CEO prepared remarks section for best results."
-            ),
+            placeholder="Paste the full earnings call transcript here...",
             label_visibility="collapsed",
         )
 
@@ -436,27 +397,18 @@ def main():
         if st.button("🚨 Load risky example"):
             transcript = SAMPLE_RISKY
 
-    # ── Analyze Button ────────────────────────────────────────────────────────
-    analyze = st.button(
-        "🔍 Analyze Dividend Risk",
-        type="primary",
-        disabled=len(transcript.strip()) < 50,
-    )
+    analyze = st.button("🔍 Analyze Dividend Risk", type="primary", disabled=len(transcript.strip()) < 50)
 
-    if not transcript.strip():
-        st.info("Paste an earnings call transcript above and click **Analyze Dividend Risk**.")
+    if not transcript.strip() or not analyze:
+        if not transcript.strip():
+            st.info("Paste an earnings call transcript above and click **Analyze Dividend Risk**.")
         return
 
-    if not analyze:
-        return
-
-    # ── Load Models ───────────────────────────────────────────────────────────
     with st.spinner("Loading models — first run may take ~30 s …"):
         sent_pipe = load_sentiment_pipeline()
         risk_pipe = load_risk_pipeline()
         zs_pipe   = load_zeroshot_pipeline()
 
-    # ── Run All Three Pipelines ───────────────────────────────────────────────
     chunks   = chunk_text(transcript)
     n_chunks = len(chunks)
     prog     = st.progress(0, text="Pipeline 1/3 — Financial Sentiment …")
@@ -483,7 +435,6 @@ def main():
     time.sleep(0.4)
     prog.empty()
 
-    # ── Header Row ────────────────────────────────────────────────────────────
     st.divider()
     h_col, b_col = st.columns([3, 1])
     with h_col:
@@ -499,13 +450,10 @@ def main():
         }
         bstyle, icon = badge_style[signal]
         st.markdown(
-            f"<div style='{bstyle};padding:12px 16px;border-radius:8px;"
-            f"text-align:center;font-weight:700;font-size:1.2em;margin-top:6px'>"
-            f"{icon} {signal}</div>",
+            f"<div style='{bstyle};padding:12px 16px;border-radius:8px;text-align:center;font-weight:700;font-size:1.2em;margin-top:6px'>{icon} {signal}</div>",
             unsafe_allow_html=True,
         )
 
-    # ── Gauge + Breakdown ─────────────────────────────────────────────────────
     g_col, br_col = st.columns([1, 1])
 
     with g_col:
@@ -514,75 +462,31 @@ def main():
     with br_col:
         st.markdown("### Pipeline Score Breakdown")
         pipeline_rows = [
-            (
-                "Pipeline 1 — Financial Sentiment",
-                sentiment_res["danger_score"],
-                f"Negative: {sentiment_res['negative']:.1%}  |  "
-                f"Positive: {sentiment_res['positive']:.1%}  |  "
-                f"Neutral: {sentiment_res['neutral']:.1%}",
-            ),
-            (
-                "Pipeline 2 — Dividend Risk Classifier  ★",
-                risk_res["danger_score"],
-                f"High risk: {risk_res['high_prob']:.1%}  |  "
-                f"Medium: {risk_res['med_prob']:.1%}  |  "
-                f"Low: {risk_res['low_prob']:.1%}  → dominant: {risk_res['dominant_class']}",
-            ),
-            (
-                "Pipeline 3 — Zero-Shot Topic Check",
-                topic_res["danger_score"],
-                f"Top topic: {topic_res['top_topic']}",
-            ),
+            ("Pipeline 1 — Financial Sentiment", sentiment_res["danger_score"], f"Negative: {sentiment_res['negative']:.1%}  |  Positive: {sentiment_res['positive']:.1%}  |  Neutral: {sentiment_res['neutral']:.1%}"),
+            ("Pipeline 2 — Dividend Risk Classifier  ★", risk_res["danger_score"], f"High risk: {risk_res['high_prob']:.1%}  |  Medium: {risk_res['med_prob']:.1%}  |  Low: {risk_res['low_prob']:.1%}  → dominant: {risk_res['dominant_class']}"),
+            ("Pipeline 3 — Zero-Shot Topic Check", topic_res["danger_score"], f"Top topic: {topic_res['top_topic']}"),
         ]
         for name, score, detail in pipeline_rows:
-            bar_c = (
-                "#1D9E75" if score <= 30 else
-                "#BA7517" if score <= 55 else
-                "#D85A30" if score <= 75 else "#A32D2D"
-            )
+            bar_c = "#1D9E75" if score <= 30 else "#BA7517" if score <= 55 else "#D85A30" if score <= 75 else "#A32D2D"
             st.markdown(f"**{name}**")
-            st.markdown(
-                f"<small style='color:gray'>{detail}</small>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<small style='color:gray'>{detail}</small>", unsafe_allow_html=True)
             st.progress(int(score) / 100)
-            st.markdown(
-                f"<p style='text-align:right;color:{bar_c};font-weight:600;"
-                f"margin:-10px 0 10px'>Score: {score:.1f} / 100</p>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<p style='text-align:right;color:{bar_c};font-weight:600;margin:-10px 0 10px'>Score: {score:.1f} / 100</p>", unsafe_allow_html=True)
 
-    # ── Zero-Shot Topic Table & Bar ───────────────────────────────────────────
     st.divider()
     st.subheader("🏷️ Dividend-Risk Topic Relevance (Pipeline 3)")
 
     t_col1, t_col2 = st.columns([2, 3])
-    sorted_topics = sorted(
-        topic_res["label_scores"].items(), key=lambda x: x[1], reverse=True
-    )
+    sorted_topics = sorted(topic_res["label_scores"].items(), key=lambda x: x[1], reverse=True)
     with t_col1:
-        st.dataframe(
-            pd.DataFrame(sorted_topics, columns=["Risk Topic", "Score"]).assign(
-                Score=lambda df: df["Score"].map("{:.1%}".format)
-            ),
-            hide_index=True,
-            use_container_width=True,
-        )
+        st.dataframe(pd.DataFrame(sorted_topics, columns=["Risk Topic", "Score"]).assign(Score=lambda df: df["Score"].map("{:.1%}".format)), hide_index=True, use_container_width=True)
     with t_col2:
-        vals   = [v for _, v in sorted_topics]
-        labels = [k for k, _ in sorted_topics]
-        st.bar_chart(
-            pd.DataFrame({"Risk Score": vals}, index=labels),
-            use_container_width=True,
-            height=220,
-        )
+        vals, labels = [v for _, v in sorted_topics], [k for k, _ in sorted_topics]
+        st.bar_chart(pd.DataFrame({"Risk Score": vals}, index=labels), use_container_width=True, height=220)
 
-    # ── Risky Sentence Highlights ─────────────────────────────────────────────
     st.divider()
     st.subheader("⚠️ Highest-Risk Sentences Detected")
-    st.caption(
-        "Ranked by combined negativity (Pipeline 1) × high-risk probability (Pipeline 2)."
-    )
+    st.caption("Ranked by combined negativity (Pipeline 1) × high-risk probability (Pipeline 2).")
     with st.spinner("Scoring sentences …"):
         risky_sents = highlight_risky_sentences(transcript, sent_pipe, risk_pipe)
 
@@ -591,83 +495,44 @@ def main():
             rp = item["score"] * 100
             bc = "#A32D2D" if rp > 60 else "#D85A30" if rp > 40 else "#BA7517"
             st.markdown(
-                f"<div style='border-left:4px solid {bc};padding:8px 14px;"
-                f"margin:5px 0;background:rgba(0,0,0,0.02);border-radius:0 6px 6px 0'>"
-                f"<span style='color:{bc};font-weight:600;font-size:0.8em'>"
-                f"#{i} · Risk score: {rp:.0f}/100</span><br>"
-                f"<span style='font-size:0.94em'>{item['sentence']}</span>"
-                f"</div>",
+                f"<div style='border-left:4px solid {bc};padding:8px 14px;margin:5px 0;background:rgba(0,0,0,0.02);border-radius:0 6px 6px 0'>"
+                f"<span style='color:{bc};font-weight:600;font-size:0.8em'>#{i} · Risk score: {rp:.0f}/100</span><br>"
+                f"<span style='font-size:0.94em'>{item['sentence']}</span></div>",
                 unsafe_allow_html=True,
             )
     else:
         st.info("No strongly risky sentences found.")
 
-    # ── Recommendation Box ────────────────────────────────────────────────────
     st.divider()
     st.subheader("💡 System Recommendation")
     recommendations = {
-        "HEALTHY": (
-            "The transcript shows **healthy dividend language**. Sentiment is predominantly "
-            "positive, the risk classifier indicates low cut probability, and dividend-risk "
-            "topics are not prominently featured. **Action:** Monitor normally — "
-            "no immediate concern."
-        ),
-        "CAUTION": (
-            "The transcript shows **some cautionary signals**. Moderate negative sentiment "
-            "or ambiguous language around cash flow and payout ratios is detected. "
-            "**Action:** Review payout ratio, free cash flow coverage, and debt trajectory. "
-            "Monitor closely next quarter."
-        ),
-        "DANGER": (
-            f"The transcript contains **significant dividend risk signals**. High negativity "
-            f"and elevated risk classification scores detected across multiple chunks. "
-            f"Top risk topic flagged: *{topic_res['top_topic']}*. "
-            f"**Action:** Reduce exposure or hedge. Review balance sheet and "
-            f"dividend coverage ratio immediately."
-        ),
-        "CRITICAL": (
-            f"The transcript triggers **critical dividend risk alerts** across all pipelines. "
-            f"Strong signals of liquidity stress, negative cash flow language, or explicit "
-            f"dividend review discussion detected. Top topic: *{topic_res['top_topic']}*. "
-            f"**Action:** High probability of dividend cut or suspension. "
-            f"Consider immediate position review."
-        ),
+        "HEALTHY": ("The transcript shows **healthy dividend language**. Sentiment is predominantly positive, the risk classifier indicates low cut probability, and dividend-risk topics are not prominently featured. **Action:** Monitor normally — no immediate concern."),
+        "CAUTION": ("The transcript shows **some cautionary signals**. Moderate negative sentiment or ambiguous language around cash flow and payout ratios is detected. **Action:** Review payout ratio, free cash flow coverage, and debt trajectory. Monitor closely next quarter."),
+        "DANGER": (f"The transcript contains **significant dividend risk signals**. High negativity and elevated risk classification scores detected across multiple chunks. Top risk topic flagged: *{topic_res['top_topic']}*. **Action:** Reduce exposure or hedge. Review balance sheet and dividend coverage ratio immediately."),
+        "CRITICAL": (f"The transcript triggers **critical dividend risk alerts** across all pipelines. Strong signals of liquidity stress, negative cash flow language, or explicit dividend review discussion detected. Top topic: *{topic_res['top_topic']}*. **Action:** High probability of dividend cut or suspension. Consider immediate position review."),
     }
-    rec_bg = {
-        "HEALTHY": "#E1F5EE", "CAUTION": "#FAEEDA",
-        "DANGER":  "#FAECE7", "CRITICAL": "#FCEBEB",
-    }
+    rec_bg = {"HEALTHY": "#E1F5EE", "CAUTION": "#FAEEDA", "DANGER": "#FAECE7", "CRITICAL": "#FCEBEB"}
     st.markdown(
-        f"<div style='background:{rec_bg[signal]};padding:16px 20px;"
-        f"border-radius:8px;border-left:5px solid {color}'>"
-        f"{recommendations[signal]}</div>",
+        f"<div style='background:{rec_bg[signal]};padding:16px 20px;border-radius:8px;border-left:5px solid {color}'>{recommendations[signal]}</div>",
         unsafe_allow_html=True,
     )
 
-    # ── Export ────────────────────────────────────────────────────────────────
     st.divider()
-    export_df = pd.DataFrame(
-        [
-            {
-                "Company":             company_name,
-                "Ticker":              ticker,
-                "Quarter":             quarter,
-                "Danger Index":        danger_index,
-                "Signal":              signal,
-                "Sentiment Score":     round(sentiment_res["danger_score"], 2),
-                "Risk Score":          round(risk_res["danger_score"], 2),
-                "Topic Score":         round(topic_res["danger_score"], 2),
-                "Positive Sentiment":  round(sentiment_res["positive"], 4),
-                "Negative Sentiment":  round(sentiment_res["negative"], 4),
-                "Low Risk Prob":       round(risk_res["low_prob"], 4),
-                "Medium Risk Prob":    round(risk_res["med_prob"], 4),
-                "High Risk Prob":      round(risk_res["high_prob"], 4),
-                "Top Risk Topic":      topic_res["top_topic"],
-                "Chunks Analysed":     n_chunks,
-                "Runtime (s)":         runtime,
-            }
-        ]
-    )
+    export_df = pd.DataFrame([{
+        "Company": company_name, "Ticker": ticker, "Quarter": quarter,
+        "Danger Index": danger_index, "Signal": signal,
+        "Sentiment Score": round(sentiment_res["danger_score"], 2),
+        "Risk Score": round(risk_res["danger_score"], 2),
+        "Topic Score": round(topic_res["danger_score"], 2),
+        "Positive Sentiment": round(sentiment_res["positive"], 4),
+        "Negative Sentiment": round(sentiment_res["negative"], 4),
+        "Low Risk Prob": round(risk_res["low_prob"], 4),
+        "Medium Risk Prob": round(risk_res["med_prob"], 4),
+        "High Risk Prob": round(risk_res["high_prob"], 4),
+        "Top Risk Topic": topic_res["top_topic"],
+        "Chunks Analysed": n_chunks, "Runtime (s)": runtime,
+    }])
+    
     st.download_button(
         label="📥 Export Results (CSV)",
         data=export_df.to_csv(index=False),
@@ -675,6 +540,6 @@ def main():
         mime="text/csv",
     )
 
-
 if __name__ == "__main__":
     main()
+
