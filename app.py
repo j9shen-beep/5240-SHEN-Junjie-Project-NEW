@@ -108,12 +108,14 @@ def load_zeroshot_pipeline():
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
     """Split transcript into overlapping word-level windows for batch inference."""
     words = text.split()
-    chunks, step = chunk_size - overlap
+    step = chunk_size - overlap  # ✅ Fixed: Only assign the math result to 'step'
     chunks = []
+    
     for i in range(0, len(words), step):
         chunk = " ".join(words[i : i + chunk_size])
         if len(chunk.strip()) > 20:
             chunks.append(chunk)
+            
     return chunks
 
 
